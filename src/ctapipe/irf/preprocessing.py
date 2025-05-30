@@ -222,10 +222,6 @@ class EventPreprocessor(Component):
             raise NotImplementedError(
                 "No support for making irfs from varying pointings yet"
             )
-        if any(events["subarray_pointing_frame"] != CoordinateFrameType.ALTAZ.value):
-            raise NotImplementedError(
-                "At the moment only pointing in altaz is supported."
-            )
 
         keep_columns, rename_from, rename_to = self.get_columns_keep_rename_scheme(
             events

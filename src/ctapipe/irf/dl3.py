@@ -611,8 +611,16 @@ class DL3_GADF(DL3_Format):
         events : QTable
             The base events table to process
         """
-        rename_from = ["event_id", "time", "reco_ra", "reco_dec", "reco_energy"]
-        rename_to = ["EVENT_ID", "TIME", "RA", "DEC", "ENERGY"]
+        rename_from = [
+            "event_id",
+            "time",
+            "reco_ra",
+            "reco_dec",
+            "reco_energy",
+            "reco_alt",
+            "reco_az",
+        ]
+        rename_to = ["EVENT_ID", "TIME", "RA", "DEC", "ENERGY", "ALT", "AZ"]
 
         if self.optional_dl3_columns:
             rename_from_optional = [
@@ -693,11 +701,6 @@ class DL3_GADF(DL3_Format):
             )
 
         QTable(table_structure).sort("START")
-        for i in range(len(table_structure) - 1):
-            if table_structure["STOP"][i] > table_structure["START"][i + 1]:
-                self.log.warning("Overlapping GTI intervals")
-                break
-
         return QTable(table_structure)
 
     def create_pointing_table(self) -> QTable:

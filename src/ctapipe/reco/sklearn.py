@@ -274,6 +274,7 @@ class SKLearnRegressionReconstructor(SKLearnReconstructor):
     ).tag(config=True)
 
     def _predict(self, key, table):
+        key = list(self._models.keys())[0]
         if key not in self._models:
             raise KeyError(
                 f"No model available for key {key},"
@@ -337,6 +338,7 @@ class SKLearnClassificationReconstructor(SKLearnReconstructor):
     ).tag(config=True)
 
     def _predict(self, key, table):
+        key = list(self._models.keys())[0]
         if key not in self._models:
             raise KeyError(
                 f"No model available for key {key},"
@@ -358,6 +360,7 @@ class SKLearnClassificationReconstructor(SKLearnReconstructor):
         return prediction, valid
 
     def _predict_score(self, key, table):
+        key = list(self._models.keys())[0]
         if key not in self._models:
             raise KeyError(
                 f"No model available for key {key},"
@@ -686,6 +689,7 @@ class DispReconstructor(Reconstructor):
         return self.subarray.to_table("joined")
 
     def _predict(self, key, table):
+        key = list(self._models.keys())[0]
         if key not in self._models:
             raise KeyError(
                 f"No model available for key {key},"

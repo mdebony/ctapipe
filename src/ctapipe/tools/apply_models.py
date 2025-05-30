@@ -190,7 +190,8 @@ class ApplyModels(Tool):
 
             try:
                 predictions = reconstructor.predict_table(tel, table)
-            except KeyError:
+            except KeyError as e:
+                print(e)
                 self.log.warning(
                     "No model in %s for telescope type %s, skipping tel %d",
                     reconstructor,
