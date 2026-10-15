@@ -1,9 +1,15 @@
+import shutil
+from copy import deepcopy
+
 import astropy.units as u
 import numpy as np
 import pytest
+import tables
 from astropy.time import Time
 
+from ctapipe.containers import ArrayEventContainer
 from ctapipe.exceptions import InputMissing
+from ctapipe.instrument import SubarrayDescription
 from ctapipe.io import (
     EventSource,
     HDF5MonitoringSource,
@@ -14,10 +20,65 @@ from ctapipe.io import (
 from ctapipe.io.hdf5dataformat import (
     DL0_TEL_POINTING_GROUP,
     DL1_CAMERA_COEFFICIENTS_GROUP,
+    DL1_FLATFIELD_IMAGE_GROUP,
     DL1_FLATFIELD_PEAK_TIME_GROUP,
+    DL1_PIXEL_STATISTICS_GROUP,
     DL1_SKY_PEDESTAL_IMAGE_GROUP,
 )
 from ctapipe.utils import get_dataset_path
+
+
+def _make_monitoring_file(path, source_path, monitoring_type):
+    """Copy a single-telescope fixture and keep only the selected monitoring type."""
+    shutil.copy(source_path, path)
+    remove = {
+        "coefficients": [DL1_PIXEL_STATISTICS_GROUP],
+        "pedestal": [
+            DL1_CAMERA_COEFFICIENTS_GROUP,
+            DL1_FLATFIELD_IMAGE_GROUP,
+            DL1_FLATFIELD_PEAK_TIME_GROUP,
+        ],
+        "pointing": [DL1_CAMERA_COEFFICIENTS_GROUP, DL1_PIXEL_STATISTICS_GROUP],
+    }
+    groups_to_remove = remove[monitoring_type]
+    with tables.open_file(path, mode="r+") as h5file:
+        for group in groups_to_remove:
+            if group in h5file:
+                h5file.remove_node(group, recursive=True)
+
+    return SubarrayDescription.from_hdf(path)
+
+
+def _seed_event_monitoring(event, subarray):
+    """Seed distinct values so replacements of any monitoring part are visible."""
+    for tel_id in subarray.tel_ids:
+        camera = event.monitoring.tel[tel_id].camera
+        n_pixels = subarray.tel[tel_id].camera.geometry.n_pixels
+        camera.coefficients.factor = np.full((2, n_pixels), 11 + tel_id)
+        camera.coefficients.pedestal_offset = np.full((2, n_pixels), 21 + tel_id)
+        camera.coefficients.time_shift = np.full((2, n_pixels), 31 + tel_id)
+        camera.coefficients.outlier_mask = np.zeros((2, n_pixels), dtype=bool)
+        camera.coefficients.outlier_mask[:, ::2] = True
+        for index, subtype in enumerate(
+            ("pedestal_image", "flatfield_image", "flatfield_peak_time")
+        ):
+            statistics = getattr(camera.pixel_statistics, subtype)
+            for field, offset in (("mean", 40), ("median", 50), ("std", 60)):
+                setattr(statistics, field, np.full(n_pixels, offset + index + tel_id))
+        event.monitoring.tel[tel_id].pointing.altitude = (40 + tel_id) * u.deg
+        event.monitoring.tel[tel_id].pointing.azimuth = (80 + tel_id) * u.deg
+
+
+def _assert_coefficients_equal(actual, expected):
+    assert actual.time == expected.time
+    for field in ("factor", "pedestal_offset", "time_shift", "outlier_mask"):
+        np.testing.assert_array_equal(getattr(actual, field), getattr(expected, field))
+    assert actual.is_valid == expected.is_valid
+
+
+def _assert_statistics_equal(actual, expected):
+    for field in ("mean", "median", "std"):
+        np.testing.assert_array_equal(getattr(actual, field), getattr(expected, field))
 
 
 def test_hdf5_monitoring_source_subarray():
@@ -649,3 +710,117 @@ def test_get_values_errors(calibpipe_camcalib_sims_single_chunk):
         # Test error when tel_id missing
         with pytest.raises(TypeError, match="tel_id is required"):
             source.get_values(MonitoringType.CAMERA_COEFFICIENTS, time=None)
+
+
+@pytest.mark.parametrize("monitoring_type", ["pointing", "coefficients", "pedestal"])
+def test_fill_monitoring_preserves_unavailable_data(
+    tmp_path,
+    monitoring_type,
+    calibpipe_camcalib_obslike_same_chunks,
+    dl1_mon_pointing_file_obs,
+):
+    tel_id = 1
+    source_path = (
+        dl1_mon_pointing_file_obs
+        if monitoring_type == "pointing"
+        else calibpipe_camcalib_obslike_same_chunks
+    )
+    path = tmp_path / f"{monitoring_type}.h5"
+    subarray = _make_monitoring_file(path, source_path, monitoring_type)
+    coefficients_table = read_table(
+        calibpipe_camcalib_obslike_same_chunks,
+        f"{DL1_CAMERA_COEFFICIENTS_GROUP}/tel_{tel_id:03d}",
+    )
+    event_time = coefficients_table["time"][0] + 0.5 * u.s
+    event = ArrayEventContainer()
+    event.trigger.time = event_time
+    _seed_event_monitoring(event, subarray)
+    before = deepcopy(event.monitoring.tel[tel_id])
+
+    with HDF5MonitoringSource(subarray=subarray, input_files=[path]) as source:
+        expected_camera = (
+            source.get_camera_monitoring_container(tel_id, event_time)
+            if monitoring_type in ("coefficients", "pedestal")
+            else None
+        )
+        expected_pointing = (
+            source.get_telescope_pointing_container(tel_id, event_time)
+            if monitoring_type == "pointing"
+            else None
+        )
+        source.fill_monitoring_container(event)
+
+    telescope = event.monitoring.tel[tel_id]
+    if monitoring_type == "coefficients":
+        _assert_coefficients_equal(
+            telescope.camera.coefficients, expected_camera.coefficients
+        )
+    else:
+        _assert_coefficients_equal(
+            telescope.camera.coefficients, before.camera.coefficients
+        )
+
+    for subtype in ("pedestal_image", "flatfield_image", "flatfield_peak_time"):
+        expected = (
+            getattr(expected_camera.pixel_statistics, subtype)
+            if monitoring_type == "pedestal" and subtype == "pedestal_image"
+            else getattr(before.camera.pixel_statistics, subtype)
+        )
+        _assert_statistics_equal(
+            getattr(telescope.camera.pixel_statistics, subtype), expected
+        )
+
+    if monitoring_type == "pointing":
+        assert telescope.pointing.altitude == expected_pointing.altitude
+        assert telescope.pointing.azimuth == expected_pointing.azimuth
+    else:
+        assert telescope.pointing.altitude == before.pointing.altitude
+        assert telescope.pointing.azimuth == before.pointing.azimuth
+
+
+@pytest.mark.parametrize(
+    "order", [("coefficients", "pedestal"), ("pedestal", "coefficients")]
+)
+def test_fill_monitoring_combines_sequential_sources(
+    tmp_path,
+    order,
+    calibpipe_camcalib_obslike_same_chunks,
+):
+    tel_id = 1
+    paths = {
+        "coefficients": tmp_path / "coefficients.h5",
+        "pedestal": tmp_path / "pedestal.h5",
+    }
+    subarray = _make_monitoring_file(
+        paths["coefficients"],
+        calibpipe_camcalib_obslike_same_chunks,
+        "coefficients",
+    )
+    _make_monitoring_file(
+        paths["pedestal"], calibpipe_camcalib_obslike_same_chunks, "pedestal"
+    )
+    coefficients_table = read_table(
+        calibpipe_camcalib_obslike_same_chunks,
+        f"{DL1_CAMERA_COEFFICIENTS_GROUP}/tel_{tel_id:03d}",
+    )
+    event_time = coefficients_table["time"][0] + 0.5 * u.s
+    event = ArrayEventContainer()
+    event.trigger.time = event_time
+    _seed_event_monitoring(event, subarray)
+
+    expected_coefficients = None
+    expected_pedestal = None
+    for kind in order:
+        with HDF5MonitoringSource(
+            subarray=subarray, input_files=[paths[kind]]
+        ) as source:
+            expected = source.get_camera_monitoring_container(tel_id, event_time)
+            if kind == "coefficients":
+                expected_coefficients = expected.coefficients
+            else:
+                expected_pedestal = expected.pixel_statistics.pedestal_image
+            source.fill_monitoring_container(event)
+
+    actual = event.monitoring.tel[tel_id].camera
+    _assert_coefficients_equal(actual.coefficients, expected_coefficients)
+    _assert_statistics_equal(actual.pixel_statistics.pedestal_image, expected_pedestal)
